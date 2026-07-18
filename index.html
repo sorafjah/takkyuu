@@ -271,16 +271,17 @@ renderer.shadowMap.enabled = false;
 wrap.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x10141c);
-scene.fog = new THREE.Fog(0x10141c, 7, 15);
+scene.background = new THREE.Color(0x232b3d);
+scene.fog = new THREE.Fog(0x232b3d, 8, 17);
 
 const camera = new THREE.PerspectiveCamera(52, innerWidth / innerHeight, 0.1, 40);
 
 // ライト
-scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x1a1408, 0.9));
-const dl = new THREE.DirectionalLight(0xffffff, 1.1);
+scene.add(new THREE.HemisphereLight(0xd8e6ff, 0x3a331f, 1.35));
+const dl = new THREE.DirectionalLight(0xffffff, 1.7);
 dl.position.set(2, 5, 2);
 scene.add(dl);
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
 
 // 床
 {
@@ -367,7 +368,7 @@ function makeCharacter(bodyColor, paddleColor) {
     new THREE.CylinderGeometry(0.085, 0.085, 0.015, 20),
     new THREE.MeshLambertMaterial({ color: paddleColor })
   );
-  blade.rotation.z = Math.PI / 2;
+  blade.rotation.x = Math.PI / 2;
   blade.position.set(0.3, 0, 0);
   arm.add(blade);
   const grip = new THREE.Mesh(
@@ -491,7 +492,15 @@ function onSwipe(stroke) {
   tryPlayerHit(course, power, spin);
 }
 
+// オーバーレイ（操作説明・リザルト画面のボタン等）上のタッチはゲーム入力として処理しない。
+// これによりiOS Safariの「touchstartをpreventDefaultするとclickが発火しない」問題を回避する。
+function isOverlayTouch(e) {
+  const t = e.target;
+  return !!(t && t.closest && t.closest('.overlay'));
+}
+
 document.addEventListener('touchstart', e => {
+  if (isOverlayTouch(e)) return;
   e.preventDefault();
   audio();
   for (const t of e.changedTouches) {
@@ -511,6 +520,7 @@ document.addEventListener('touchstart', e => {
 }, { passive: false });
 
 document.addEventListener('touchmove', e => {
+  if (isOverlayTouch(e)) return;
   e.preventDefault();
   for (const t of e.changedTouches) {
     if (t.identifier === stickId) {
@@ -525,6 +535,7 @@ document.addEventListener('touchmove', e => {
 
 let lastTapEnd = 0;
 document.addEventListener('touchend', e => {
+  if (isOverlayTouch(e)) return;
   // 300ms以内の連続タップでのズームをブロック
   const now = performance.now();
   if (now - lastTapEnd < 300) e.preventDefault();
@@ -588,17 +599,23 @@ addEventListener('mouseup', e => {
 // ---------- ボール物理（自前・放物運動＋反射） ----------
 
 /**
- * 着地点(tx, tz)にちょうど落ちる初速を計算してボールを発射する。
- * gEff（実効重力）にスピンの効果を織り込むことで、
- * トップスピン＝沈む / カット＝浮く、を軌道解と実シミュレーションで一致させる。
+ * 頂点の高さ(apex)と初速から飛行時間を逆算し、その時間で(tx, tz)にちょうど
+ * 落ちる水平速度を与える。Tを固定して垂直速度を逆算する旧方式だと、
+ * 台の長さに対して滞空時間が長くなり、山なりで高く飛びすぎてしまうため、
+ * 「頂点の高さ」を直接指定できるこちらの方式に変更した。
  */
-function launchBall(x0, y0, z0, tx, tz, T, spin, hitter) {
-  const gEff = GRAVITY * (1 + 0.4 * spin);   // トップスピンで沈み、カットで浮く
+function launchBall(x0, y0, z0, tx, tz, apex, spin, hitter) {
+  const gEff = GRAVITY * (1 + 0.35 * spin);   // トップスピンで沈み、カットで浮く
+  const vy0 = Math.sqrt(2 * gEff * Math.max(apex, 0.02));
+  const landY = TABLE.H + BALL_R;
+  // y0 + vy0*t - 0.5*g*t^2 = landY を満たす正の解（頂点を過ぎて着地する側の解）
+  const disc = Math.max(0, vy0 * vy0 - 2 * gEff * (landY - y0));
+  const T = Math.max(0.16, (vy0 + Math.sqrt(disc)) / gEff);
+
   ball.x = x0; ball.y = y0; ball.z = z0;
   ball.vx = (tx - x0) / T;
   ball.vz = (tz - z0) / T;
-  const landY = TABLE.H + BALL_R;
-  ball.vy = (landY - y0 + 0.5 * gEff * T * T) / T;
+  ball.vy = vy0;
   ball.gEff = gEff;
   ball.spin = spin;
   ball.lastHit = hitter;
@@ -656,11 +673,10 @@ function doHit(who, course, power, spin, isServe = false) {
   // power最大付近でエンドラインを越えうる
   const tz = sign * depth;
 
-  // 飛行時間：パワーが高いほど短い。トップスピンはさらに短くできる
-  let T = THREE.MathUtils.lerp(1.05, 0.55, power) * (1 - 0.12 * spin);
-  if (isServe) T = Math.max(T, 0.8);
+  // 頂点の高さ：パワーが高いほど低く速い弾道に。トップスピンはさらに低く、カットは高めに浮く
+  const apex = Math.max(0.05, THREE.MathUtils.lerp(0.2, 0.07, power) * (1 - 0.18 * spin));
 
-  launchBall(x0, y0, z0, tx, tz, T, spin, who);
+  launchBall(x0, y0, z0, tx, tz, apex, spin, who);
   sndHit();
   p.swing = 1;
   p.swingDir = course >= 0 ? 1 : -1;
