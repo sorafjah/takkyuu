@@ -68,6 +68,11 @@
   }
   #submsg.show { opacity: 0.9; }
 
+  #hitFlash {
+    position: fixed; inset: 0; background: #fff7e0;
+    opacity: 0; pointer-events: none; z-index: 15;
+  }
+
   /* ===== 仮想スティック ===== */
   #stick { position: fixed; z-index: 9; pointer-events: none; display: none; }
   #stickBase {
@@ -155,6 +160,7 @@
 </div>
 <div id="msg"></div>
 <div id="submsg"></div>
+<div id="hitFlash"></div>
 
 <div id="stick"><div id="stickBase"></div><div id="stickKnob"></div></div>
 
@@ -166,14 +172,12 @@
     <div class="howto-card">
       <h3>左半分：移動</h3>
       <svg viewBox="0 0 100 100">
-        <circle cx="50" cy="50" r="34" fill="none" stroke="rgba(255,255,255,0.4)" stroke-width="2"/>
         <circle cx="50" cy="50" r="14" fill="rgba(255,255,255,0.7)"/>
-        <path d="M50 8 L44 18 L56 18 Z" fill="#ffd24d"/>
-        <path d="M50 92 L44 82 L56 82 Z" fill="#ffd24d"/>
-        <path d="M8 50 L18 44 L18 56 Z" fill="#ffd24d"/>
-        <path d="M92 50 L82 44 L82 56 Z" fill="#ffd24d"/>
+        <line x1="14" y1="50" x2="86" y2="50" stroke="rgba(255,255,255,0.35)" stroke-width="2"/>
+        <path d="M14 50 L26 42 L26 58 Z" fill="#ffd24d"/>
+        <path d="M86 50 L74 42 L74 58 Z" fill="#ffd24d"/>
       </svg>
-      <p>画面の<b>左半分</b>を触るとスティックが出ます。<br><b>左右</b>＝サイドステップ<br><b>上下</b>＝台に近づく / 下がる</p>
+      <p>画面の<b>左半分</b>を触るとスティックが出ます。<br><b>左右</b>にスライドしてサイドステップで動きます。</p>
     </div>
     <div class="howto-card">
       <h3>右半分：打つ</h3>
@@ -216,7 +220,7 @@ const TABLE = { L: 2.74, W: 1.525, H: 0.76, NET_H: 0.1525 };
 const HALF_L = TABLE.L / 2;           // 1.37
 const HALF_W = TABLE.W / 2;           // 0.7625
 const BALL_R = 0.028;
-const GRAVITY = 9.0;                   // ややアーケード寄り（本物は9.8）
+const GRAVITY = 6.8;                   // ゆっくりめの滞空時間になるよう調整（本物は9.8）
 const FLOOR_Y = 0;
 
 // プレイヤー可動域
@@ -240,6 +244,7 @@ const state = {
   serverIsPlayer: true,
   rallying: false,
   pointPause: 0,
+  hitStop: 0,   // ヒット瞬間の一瞬の間（演出用）。0より大きい間は物理更新を止める
 };
 
 // 内部データモデル（※メッシュの .position 直代入ではなく、
@@ -275,6 +280,9 @@ scene.background = new THREE.Color(0x232b3d);
 scene.fog = new THREE.Fog(0x232b3d, 8, 17);
 
 const camera = new THREE.PerspectiveCamera(52, innerWidth / innerHeight, 0.1, 40);
+// カメラは常に固定（プレイヤー初期Z位置を基準に、台全体を見下ろす角度で据え置く）
+camera.position.set(0, 2.15, player.z + 1.45);
+camera.lookAt(0, TABLE.H + 0.05, -0.6);
 
 // ライト
 scene.add(new THREE.HemisphereLight(0xd8e6ff, 0x3a331f, 1.35));
@@ -401,6 +409,25 @@ const blob = new THREE.Mesh(
 blob.rotation.x = -Math.PI / 2;
 scene.add(blob);
 
+// ヒット衝撃エフェクト（小さな光の球が一瞬膨らんで消える）用のメッシュプール
+const impactPool = [];
+for (let i = 0; i < 6; i++) {
+  const m = new THREE.Mesh(
+    new THREE.SphereGeometry(1, 10, 8),
+    new THREE.MeshBasicMaterial({ color: 0xfff3d6, transparent: true, opacity: 0 })
+  );
+  m.visible = false;
+  scene.add(m);
+  impactPool.push({ mesh: m, life: 0, maxLife: 0.16 });
+}
+function spawnImpact(x, y, z, punch = 1) {
+  const slot = impactPool.find(s => s.life <= 0) || impactPool[0];
+  slot.mesh.position.set(x, y, z);
+  slot.mesh.visible = true;
+  slot.life = slot.maxLife;
+  slot.punch = punch;
+}
+
 // ---------- Web Audio ----------
 let actx = null;
 function audio() {
@@ -420,7 +447,7 @@ function beep(freq, dur, type = 'triangle', vol = 0.25, slide = 0) {
     o.start(); o.stop(ac.currentTime + dur);
   } catch (e) { /* 音は失敗しても続行 */ }
 }
-const sndHit = () => beep(300, 0.07, 'square', 0.18, -80);
+const sndHit = () => { beep(140, 0.05, 'sine', 0.22, -60); beep(340, 0.06, 'square', 0.16, -100); };
 const sndBounce = () => beep(150, 0.05, 'sine', 0.2, -40);
 const sndNet = () => beep(90, 0.15, 'sawtooth', 0.15, -30);
 const sndPointP = () => { beep(660, 0.1, 'triangle', 0.22); setTimeout(() => beep(880, 0.18, 'triangle', 0.22), 100); };
@@ -440,6 +467,15 @@ function showMsg(t, ms = 1100) {
 function showSub(t, on = true) {
   subEl.textContent = t;
   subEl.classList.toggle('show', on);
+}
+const hitFlashEl = $('hitFlash');
+function flashScreen(strength = 0.16) {
+  hitFlashEl.style.transition = 'none';
+  hitFlashEl.style.opacity = strength;
+  requestAnimationFrame(() => {
+    hitFlashEl.style.transition = 'opacity 0.16s ease-out';
+    hitFlashEl.style.opacity = 0;
+  });
 }
 function updateScore() {
   $('scoreP').textContent = state.scoreP;
@@ -465,11 +501,11 @@ let trailPts = [];
 
 function setStick(dx, dy) {
   // dx,dy: ピクセル変位。スティック入力の共通経路（実タッチ・テストAPI両方が通る）
-  const len = Math.hypot(dx, dy);
-  if (len > STICK_R) { dx = dx / len * STICK_R; dy = dy / len * STICK_R; }
+  // 上下移動は廃止のため、縦方向の入力は見た目・値ともに無視し左右のみ反映する
+  dx = THREE.MathUtils.clamp(dx, -STICK_R, STICK_R);
   stickVec.x = dx / STICK_R;
-  stickVec.y = dy / STICK_R;
-  knobEl.style.transform = `translate(${dx}px, ${dy}px)`;
+  stickVec.y = 0;
+  knobEl.style.transform = `translate(${dx}px, 0px)`;
 }
 function releaseStick() {
   stickVec.x = 0; stickVec.y = 0;
@@ -678,8 +714,11 @@ function doHit(who, course, power, spin, isServe = false) {
 
   launchBall(x0, y0, z0, tx, tz, apex, spin, who);
   sndHit();
-  p.swing = 1;
+  p.swing = 1.4;   // オーバースイング分を持たせてから素早く減衰させ、当たった瞬間を強調する
   p.swingDir = course >= 0 ? 1 : -1;
+  spawnImpact(x0, y0, z0, who === 'player' ? 1 : 0.7);
+  if (who === 'player') { flashScreen(0.16); state.hitStop = 0.055; }
+  else state.hitStop = 0.03;
   if (who === 'player') cpu.whiffed = false; // 新しい球ごとにCPUのミス判定をリセット
 }
 
@@ -901,7 +940,7 @@ function loop(now) {
   if (state.phase === 'serve' || state.phase === 'rally' || state.phase === 'point') {
     const spd = 2.8;
     player.x = THREE.MathUtils.clamp(player.x + stickVec.x * spd * dt, -P_X_RANGE, P_X_RANGE);
-    player.z = THREE.MathUtils.clamp(player.z + stickVec.y * spd * dt, P_Z_MIN, P_Z_MAX);
+    // 前後移動は廃止。プレイヤーZ位置は固定（player.zは初期値のまま変化しない）
   }
 
   // --- サーブ保持中はボールがプレイヤーに追従 ---
@@ -911,21 +950,25 @@ function loop(now) {
     ball.z = player.z - 0.35;
   }
 
+  // --- ヒットストップ（当たった瞬間の一瞬の間）---
+  if (state.hitStop > 0) state.hitStop = Math.max(0, state.hitStop - dt);
+  const dtEff = state.hitStop > 0 ? 0 : dt; // ヒットストップ中は物理更新を止め、当たった瞬間を強調する
+
   // --- ポイント間ポーズ ---
   if (state.phase === 'point') {
     state.pointPause -= dt;
     if (state.pointPause <= 0) startServe();
   }
 
-  updateCpu(dt);
-  if (state.phase === 'rally') updateBall(dt);
+  updateCpu(dtEff);
+  if (state.phase === 'rally') updateBall(dtEff);
 
   // --- スイングアニメ ---
   for (const p of [player, cpu]) {
-    if (p.swing > 0) p.swing = Math.max(0, p.swing - dt * 4);
+    if (p.swing > 0) p.swing = Math.max(0, p.swing - dtEff * 9);
   }
-  playerMesh.userData.arm.rotation.y = -player.swingDir * player.swing * 1.6;
-  cpuMesh.userData.arm.rotation.y = -cpu.swingDir * cpu.swing * 1.6;
+  playerMesh.userData.arm.rotation.y = -player.swingDir * Math.min(player.swing, 1) * 1.6;
+  cpuMesh.userData.arm.rotation.y = -cpu.swingDir * Math.min(cpu.swing, 1) * 1.6;
 
   // --- メッシュへ内部モデルを反映 ---
   playerMesh.position.set(player.x, 0, player.z);
@@ -940,11 +983,18 @@ function loop(now) {
     blob.material.opacity = THREE.MathUtils.clamp(0.4 - h * 0.12, 0.08, 0.4);
   }
 
-  // --- カメラ（プレイヤーに緩追従） ---
-  const camX = player.x * 0.35;
-  const camZ = player.z + 1.45;
-  camera.position.lerp(new THREE.Vector3(camX, 2.15, camZ), 0.08);
-  camera.lookAt(0, TABLE.H + 0.05, -0.6);
+  // --- 衝撃エフェクトの更新（ヒットストップ中も止めず、常にrawのdtで進める）---
+  for (const s of impactPool) {
+    if (s.life > 0) {
+      s.life = Math.max(0, s.life - dt);
+      const t = 1 - s.life / s.maxLife;
+      s.mesh.scale.setScalar(BALL_R * (1 + t * 7) * s.punch);
+      s.mesh.material.opacity = Math.max(0, 0.85 * (1 - t));
+      if (s.life <= 0) s.mesh.visible = false;
+    }
+  }
+
+  // カメラは固定（起動時に一度だけ設定済み。毎フレームの追従は行わない）
 
   // --- スワイプ軌跡描画 ---
   trailCtx.clearRect(0, 0, trailCv.width, trailCv.height);
