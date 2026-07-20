@@ -152,9 +152,9 @@
 <div id="hud">
   <div id="scoreboard">
     <div class="serve-dot" id="dotP"></div>
-    <div><div class="sc-name">あなた</div><div class="sc-num sc-p" id="scoreP">0</div></div>
+    <div style="text-align:center"><div class="sc-name">あなた</div><div class="sc-num sc-p" id="scoreP">0</div></div>
     <div class="sc-sep">-</div>
-    <div><div class="sc-num sc-c" id="scoreC">0</div><div class="sc-name" style="text-align:right">あいて</div></div>
+    <div style="text-align:center"><div class="sc-name">あいて</div><div class="sc-num sc-c" id="scoreC">0</div></div>
     <div class="serve-dot" id="dotC"></div>
   </div>
 </div>
@@ -220,7 +220,7 @@ const TABLE = { L: 2.74, W: 1.525, H: 0.76, NET_H: 0.1525 };
 const HALF_L = TABLE.L / 2;           // 1.37
 const HALF_W = TABLE.W / 2;           // 0.7625
 const BALL_R = 0.028;
-const GRAVITY = 3.8;                   // さらにゆっくりめの滞空時間になるよう再々調整（本物は9.8）
+const GRAVITY = 2.6;                   // のんびり長くラリーが続くよう、さらにゆっくりに再々々調整（本物は9.8）
 const FLOOR_Y = 0;
 
 // プレイヤー可動域
@@ -229,12 +229,12 @@ const P_Z_MIN = 1.55, P_Z_MAX = 3.0;
 
 // 難易度パラメータ（CPU）※ここをいじれば強さが変わる
 const CPU_DIFF = {
-  reactDelay: 0.18,   // 反応遅延（秒）
+  reactDelay: 0.16,   // 反応遅延（秒）
   speed: 3.0,         // 横移動速度（m/s）
-  reach: 0.8,         // 打てる横距離（m）
-  missRate: 0.03,     // 基本ミス率（下げてラリーが続きやすいように）
-  speedMissFactor: 0.03, // 速い球に対する追加ミス率係数
-  aimError: 0.12      // 狙いのブレ（m。小さくして自滅アウトを減らす）
+  reach: 0.85,        // 打てる横距離（m）
+  missRate: 0.015,    // 基本ミス率（さらに下げて長くラリーが続くように）
+  speedMissFactor: 0.015, // 速い球に対する追加ミス率係数
+  aimError: 0.09      // 狙いのブレ（m。さらに小さくして自滅アウトを減らす）
 };
 
 // ---------- ゲーム状態 ----------
@@ -263,8 +263,7 @@ const ball = {
   netHit: false,
   active: false,        // 飛行中か
   held: false,          // サーブ待ちでプレイヤーに追従中か
-  isServe: false,       // 現在飛んでいる球がサーブかどうか
-  serveBounced: false,  // サーブの自陣バウンドを消化済みか（1回だけ許可するため）
+  pendingServe: null,   // サーブ中：自陣バウンド後に相手コートへ向け打ち直す狙い {tx, tz}
 };
 
 let frames = 0, elapsed = 0;
@@ -278,8 +277,8 @@ renderer.shadowMap.enabled = false;
 wrap.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x232b3d);
-scene.fog = new THREE.Fog(0x232b3d, 8, 17);
+scene.background = new THREE.Color(0xe8ddc7);
+scene.fog = new THREE.Fog(0xe8ddc7, 9, 18);
 
 const camera = new THREE.PerspectiveCamera(52, innerWidth / innerHeight, 0.1, 40);
 // カメラは常に固定（プレイヤー初期Z位置を基準に、台全体を見下ろす角度で据え置く）
@@ -358,29 +357,89 @@ scene.add(new THREE.AmbientLight(0xffffff, 0.55));
 }
 
 // 選手（胴体＋ラケット）を作る
+
+// 浴衣風の布地テクスチャ（白地に青い柄）をcanvasで生成する
+function makeYukataTexture() {
+  const size = 128;
+  const cv = document.createElement('canvas');
+  cv.width = size; cv.height = size;
+  const ctx = cv.getContext('2d');
+  ctx.fillStyle = '#fbf8f2';
+  ctx.fillRect(0, 0, size, size);
+  ctx.fillStyle = '#2f6fb3';
+  ctx.strokeStyle = '#2f6fb3';
+  // 麻の葉風の簡易な柄（小さな六角状の模様を並べる）
+  const step = 21;
+  for (let y = -step; y < size + step; y += step) {
+    for (let x = -step; x < size + step; x += step) {
+      const offset = (Math.round(y / step) % 2) * (step / 2);
+      const cx = x + offset, cy = y;
+      ctx.beginPath();
+      for (let i = 0; i < 6; i++) {
+        const a = (Math.PI / 3) * i;
+        const px = cx + Math.cos(a) * 5.5, py = cy + Math.sin(a) * 5.5;
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(cx, cy, 1.6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  const tex = new THREE.CanvasTexture(cv);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(2.2, 2.2);
+  return tex;
+}
+const yukataTexture = makeYukataTexture();
+
 function makeCharacter(bodyColor, paddleColor) {
   const g = new THREE.Group();
   const body = new THREE.Mesh(
     new THREE.CapsuleGeometry(0.13, 0.42, 4, 12),
-    new THREE.MeshLambertMaterial({ color: bodyColor })
+    new THREE.MeshLambertMaterial({ color: 0xffffff, map: yukataTexture })
   );
   body.position.y = 0.55;
   g.add(body);
+  // 浴衣の帯（青い帯を腰に巻く）
+  const obi = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.148, 0.148, 0.09, 16),
+    new THREE.MeshLambertMaterial({ color: 0x2f4f8a })
+  );
+  obi.position.y = 0.42;
+  g.add(obi);
   const head = new THREE.Mesh(
     new THREE.SphereGeometry(0.1, 14, 12),
     new THREE.MeshLambertMaterial({ color: 0xf2c9a0 })
   );
   head.position.y = 1.0;
   g.add(head);
-  // ラケット（腕ごとグループ化してスイング回転）
+  // ラケットの代わりに大きめのスリッパ（温泉卓球）
   const arm = new THREE.Group();
-  const blade = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.085, 0.085, 0.015, 20),
+  const sole = new THREE.Mesh(
+    new THREE.BoxGeometry(0.27, 0.14, 0.028),
+    new THREE.MeshLambertMaterial({ color: 0xfaf6ee })
+  );
+  sole.position.set(0.33, 0, 0);
+  arm.add(sole);
+  // スリッパのふち（縁取り）
+  const soleEdge = new THREE.Mesh(
+    new THREE.BoxGeometry(0.27, 0.14, 0.01),
     new THREE.MeshLambertMaterial({ color: paddleColor })
   );
-  blade.rotation.x = Math.PI / 2;
-  blade.position.set(0.3, 0, 0);
-  arm.add(blade);
+  soleEdge.position.set(0.33, 0, 0.019);
+  arm.add(soleEdge);
+  // スリッパのベルト（青）
+  const strap = new THREE.Mesh(
+    new THREE.BoxGeometry(0.15, 0.035, 0.05),
+    new THREE.MeshLambertMaterial({ color: 0x2f6fb3 })
+  );
+  strap.position.set(0.33, 0.02, 0.02);
+  strap.rotation.z = 0.05;
+  arm.add(strap);
   const grip = new THREE.Mesh(
     new THREE.CylinderGeometry(0.015, 0.015, 0.12, 8),
     new THREE.MeshLambertMaterial({ color: 0xc9a26b })
@@ -397,6 +456,85 @@ const playerMesh = makeCharacter(0xd8574a, 0xcc2b2b);
 const cpuMesh = makeCharacter(0x3d6fc4, 0x1a1a1a);
 cpuMesh.rotation.y = Math.PI;
 scene.add(playerMesh, cpuMesh);
+
+// ---------- 背景（温泉の脱衣所・休憩スペース風）----------
+{
+  const wallMat = new THREE.MeshLambertMaterial({ color: 0xe4d7bb });
+  const backWall = new THREE.Mesh(new THREE.PlaneGeometry(16, 6), wallMat);
+  backWall.position.set(0, 3, -6.2);
+  scene.add(backWall);
+  const sideWallL = new THREE.Mesh(new THREE.PlaneGeometry(16, 6), wallMat);
+  sideWallL.position.set(-6.5, 3, 0);
+  sideWallL.rotation.y = Math.PI / 2;
+  scene.add(sideWallL);
+  // 腰壁（板張り風の帯）
+  const wainscot = new THREE.Mesh(
+    new THREE.BoxGeometry(16, 0.9, 0.05),
+    new THREE.MeshLambertMaterial({ color: 0xb99a68 })
+  );
+  wainscot.position.set(0, 0.9, -6.15);
+  scene.add(wainscot);
+
+  // 自動販売機（コカコーラ風の赤×白の簡易モデル）
+  const vend = new THREE.Group();
+  const vendBody = new THREE.Mesh(
+    new THREE.BoxGeometry(1.1, 2.0, 0.7),
+    new THREE.MeshLambertMaterial({ color: 0xd23b3b })
+  );
+  vendBody.position.y = 1.0;
+  vend.add(vendBody);
+  const vendPanel = new THREE.Mesh(
+    new THREE.BoxGeometry(0.85, 1.1, 0.05),
+    new THREE.MeshLambertMaterial({ color: 0xf5f0e6 })
+  );
+  vendPanel.position.set(0, 1.15, 0.36);
+  vend.add(vendPanel);
+  // ドリンクのボタン列
+  for (let i = 0; i < 6; i++) {
+    const btn = new THREE.Mesh(
+      new THREE.BoxGeometry(0.14, 0.1, 0.02),
+      new THREE.MeshLambertMaterial({ color: [0x3d8fd8, 0x3fae5c, 0xe8b23d, 0xd8574a, 0x3d8fd8, 0x3fae5c][i] })
+    );
+    btn.position.set(-0.25 + (i % 3) * 0.25, 1.42 - Math.floor(i / 3) * 0.28, 0.39);
+    vend.add(btn);
+  }
+  const vendTray = new THREE.Mesh(
+    new THREE.BoxGeometry(0.9, 0.18, 0.15),
+    new THREE.MeshLambertMaterial({ color: 0x2a2a2a })
+  );
+  vendTray.position.set(0, 0.35, 0.4);
+  vend.add(vendTray);
+  vend.position.set(-4.6, 0, -5.6);
+  scene.add(vend);
+
+  // 開いたドア（隣の部屋へ続く）
+  const doorGroup = new THREE.Group();
+  const doorFrame = new THREE.Mesh(
+    new THREE.BoxGeometry(1.15, 2.25, 0.1),
+    new THREE.MeshLambertMaterial({ color: 0x8a6a45 })
+  );
+  doorGroup.add(doorFrame);
+  // フレームの内側（開口部）から見える隣室の明かり
+  const innerGlow = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.95, 2.05),
+    new THREE.MeshBasicMaterial({ color: 0xffe9b8 })
+  );
+  innerGlow.position.z = 0.06;
+  doorGroup.add(innerGlow);
+  // 開いたドア本体（ヒンジ側を軸に約80度開いた状態）
+  const doorPanelPivot = new THREE.Group();
+  const doorPanel = new THREE.Mesh(
+    new THREE.BoxGeometry(0.9, 2.05, 0.05),
+    new THREE.MeshLambertMaterial({ color: 0x9c7b52 })
+  );
+  doorPanel.position.x = 0.45;
+  doorPanelPivot.add(doorPanel);
+  doorPanelPivot.position.set(-0.5, 0, 0.35);
+  doorPanelPivot.rotation.y = Math.PI * 0.42; // ドアが開いている角度
+  doorGroup.add(doorPanelPivot);
+  doorGroup.position.set(3.4, 1.13, -6.14);
+  scene.add(doorGroup);
+}
 
 // ボール＋落下地点シャドウ
 const ballMesh = new THREE.Mesh(
@@ -648,7 +786,7 @@ addEventListener('mouseup', e => {
  * 手前で台にバウンドする」という単一の弾道（サーブ用）を作れる。
  */
 function launchBall(x0, y0, z0, tx, tz, apex, spin, hitter, vyCap = Infinity) {
-  const gEff = GRAVITY * (1 + 0.35 * spin);   // トップスピンで沈み、カットで浮く
+  const gEff = GRAVITY * (1 + 0.2 * spin);   // トップスピンで沈み、カットで浮く（弱めに）
   let vy0 = Math.sqrt(2 * gEff * Math.max(apex, 0.02));
   const landY = TABLE.H + BALL_R;
   // y0 + vy0*t - 0.5*g*t^2 = landY を満たす正の解（頂点を過ぎて着地する側の解）
@@ -668,21 +806,20 @@ function launchBall(x0, y0, z0, tx, tz, apex, spin, hitter, vyCap = Infinity) {
   ball.netHit = false;
   ball.active = true;
   ball.held = false;
-  ball.isServe = false;
-  ball.serveBounced = false;
+  ball.pendingServe = null;
 }
 
 /**
  * コース・パワー・スピン・打つ方向から、着地目標(tx, tz)と頂点の高さ(apex)を算出する。
  */
-function computeTarget(course, power, spin, sign, minApex = 0.05) {
-  const tx = THREE.MathUtils.clamp(course, -1.25, 1.25) * (HALF_W * 0.92) * 1.1;
-  // course|>1.05相当で台幅の外に出うる（強打しすぎのリスク）
-  const depth = THREE.MathUtils.lerp(0.45, HALF_L + 0.12, power);
-  // power最大付近でエンドラインを越えうる
+function computeTarget(course, power, spin, sign, minApex = 0.04) {
+  const tx = THREE.MathUtils.clamp(course, -1.1, 1.1) * (HALF_W * 0.85) * 1.1;
+  // course|>1.0相当で台幅の外に出うる（強打しすぎのリスク）
+  const depth = THREE.MathUtils.lerp(0.4, HALF_L * 0.98, power);
+  // 台の内側に収まりやすいよう、パワー最大でも大きくは超えないように
   const tz = sign * depth;
-  // 頂点の高さ：パワーが高いほど低く速い弾道に。トップスピンはさらに低く、カットは高めに浮く
-  const apex = Math.max(minApex, THREE.MathUtils.lerp(0.2, 0.07, power) * (1 - 0.18 * spin));
+  // 頂点の高さ：直線的な低い弾道になるよう全体的に低めに。パワーが高いほどさらに低く速く
+  const apex = Math.max(minApex, THREE.MathUtils.lerp(0.11, 0.045, power) * (1 - 0.12 * spin));
   return { tx, tz, apex };
 }
 
@@ -695,7 +832,7 @@ function tryPlayerHit(course, power, spin) {
   if (state.phase !== 'rally' || ball.lastHit !== 'cpu' || !ball.active) { whiff(); return; }
 
   // ヒット判定：打球可能範囲（アーケード寄りに広め）
-  const inX = Math.abs(ball.x - player.x) < 0.9;
+  const inX = Math.abs(ball.x - player.x) < 0.38;
   const inZ = Math.abs(ball.z - player.z) < 1.0;
   const inY = ball.y < 1.7 && ball.y > TABLE.H - 0.25;
   const approaching = ball.vz > 0 || ball.z > player.z - 0.4;
@@ -727,14 +864,15 @@ function doHit(who, course, power, spin, isServe = false) {
   const y0 = Math.max(ball.y, TABLE.H + 0.12);
 
   if (isServe) {
-    // 正式ルールの「まず自陣に当ててから相手コートへ」を、狙いを変えずに実現する。
-    // 最終的な狙い（相手コート）はそのまま使いつつ、上向き初速だけ小さく抑えることで
-    // 進行方向は最初から最終目標のままに、手前（自陣）で早めに落ちて自然にバウンドする。
+    // 確実性を優先し、自陣・相手コートそれぞれの着地点を直接指定する2段階方式にする。
+    // 左右方向（tx）は最終的な狙いと揃えておき、見た目の不自然さを抑える。
     const { tx, tz, apex } = computeTarget(course, power, spin, sign);
-    launchBall(x0, y0, z0, tx, tz, apex, spin, who, 0.24);
-    ball.isServe = true;
-    ball.serveBounced = false;
-    ball.serveTargetZ = tz; // 自陣バウンド後、跳ね返りの高さをこの狙いに合わせて計算し直すために保持
+    const ownSign = -sign;
+    const tx1 = THREE.MathUtils.clamp(tx, -HALF_W * 0.85, HALF_W * 0.85);
+    const tz1 = ownSign * HALF_L * 0.28; // ネット寄りにして、その後の折れ曲がりを目立たなくする
+    const apex1 = 0.08; // 自陣バウンドは低く素早く、確実に台内に収まる高さ
+    launchBall(x0, y0, z0, tx1, tz1, apex1, spin * 0.4, who);
+    ball.pendingServe = { tx, tz };
   } else {
     const { tx, tz, apex } = computeTarget(course, power, spin, sign);
     launchBall(x0, y0, z0, tx, tz, apex, spin, who);
@@ -781,7 +919,7 @@ function updateBall(dt) {
     // スピンでバウンド変化：トップスピン＝低く前へ伸びる／カット＝失速
     const e = 0.72 * (1 - 0.12 * ball.spin);
     ball.vy = -ball.vy * e;
-    ball.vz *= (1 + 0.22 * ball.spin);
+    ball.vz *= (1 + 0.1 * ball.spin);
     ball.vx *= 0.98;
     ball.spin *= 0.55;
     sndBounce();
@@ -789,21 +927,11 @@ function updateBall(dt) {
     const sideIsPlayer = ball.z > 0;
     const hitterIsPlayer = ball.lastHit === 'player';
     if (sideIsPlayer === hitterIsPlayer) {
-      if (ball.isServe && !ball.serveBounced) {
-        // サーブの正規バウンド（自陣）：狙い・進行方向（vx, vz）はここでは一切変更しない。
-        // 跳ね返り後の上向き速度だけを、(a)残り距離をvzのまま進めば元の狙いに着地する高さと、
-        // (b)実際にネットを通過するタイミングで確実にネットを越えられる高さ、の大きい方に設定する。
-        ball.serveBounced = true;
-        const gEff2 = ball.gEff;
-        const remainingZ = ball.serveTargetZ - ball.z;
-        const T2 = Math.abs(ball.vz) > 0.05 ? remainingZ / ball.vz : 0.3;
-        const vySymmetric = T2 > 0.05 ? gEff2 * T2 / 2 : 1.2;
-
-        const netMinY = TABLE.H + TABLE.NET_H + BALL_R + 0.025; // 余裕を持たせたネット通過高さ
-        const tNet = Math.abs(ball.vz) > 0.05 ? Math.max(0.03, -ball.z / ball.vz) : 0.2;
-        const vyForNet = (netMinY - ball.y + 0.5 * gEff2 * tNet * tNet) / tNet;
-
-        ball.vy = Math.max(vySymmetric, vyForNet, 1.0);
+      if (ball.pendingServe) {
+        // サーブの正規バウンド（自陣）：ここから相手コートの狙いへ向けて改めて発射する
+        const sv = ball.pendingServe;
+        launchBall(ball.x, TABLE.H + BALL_R, ball.z, sv.tx, sv.tz, 0.2, ball.spin, ball.lastHit);
+        return;
       } else {
         // 自分の打った球が自陣に落ちた → 失点
         resolvePoint(hitterIsPlayer ? 'cpu' : 'player', 'アウト！');
@@ -852,8 +980,7 @@ function resolvePoint(winner, reason) {
   if (state.phase === 'point' || state.phase === 'over') return;
   state.phase = 'point';
   ball.active = false;
-  ball.isServe = false;
-  ball.serveBounced = false;
+  ball.pendingServe = null;
   if (winner === 'player') { state.scoreP++; sndPointP(); }
   else { state.scoreC++; sndPointC(); }
   updateScore();
@@ -884,8 +1011,7 @@ function startServe() {
   ball.netHit = false;
   ball.bouncedOnTarget = false;
   ball.sideBounces = 0;
-  ball.isServe = false;
-  ball.serveBounced = false;
+  ball.pendingServe = null;
   if (state.serverIsPlayer) {
     ball.held = true;
     ball.active = false;
