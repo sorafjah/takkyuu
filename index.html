@@ -220,21 +220,21 @@ const TABLE = { L: 2.74, W: 1.525, H: 0.76, NET_H: 0.1525 };
 const HALF_L = TABLE.L / 2;           // 1.37
 const HALF_W = TABLE.W / 2;           // 0.7625
 const BALL_R = 0.028;
-const GRAVITY = 6.8;                   // ゆっくりめの滞空時間になるよう調整（本物は9.8）
+const GRAVITY = 3.8;                   // さらにゆっくりめの滞空時間になるよう再々調整（本物は9.8）
 const FLOOR_Y = 0;
 
 // プレイヤー可動域
-const P_X_RANGE = 1.45;
+const P_X_RANGE = 0.8;   // 台の幅（半幅0.7625）程度に制限
 const P_Z_MIN = 1.55, P_Z_MAX = 3.0;
 
 // 難易度パラメータ（CPU）※ここをいじれば強さが変わる
 const CPU_DIFF = {
-  reactDelay: 0.22,   // 反応遅延（秒）
-  speed: 2.6,         // 横移動速度（m/s）
-  reach: 0.62,        // 打てる横距離（m）
-  missRate: 0.06,     // 基本ミス率
-  speedMissFactor: 0.05, // 速い球に対する追加ミス率係数
-  aimError: 0.18      // 狙いのブレ（m）
+  reactDelay: 0.18,   // 反応遅延（秒）
+  speed: 3.0,         // 横移動速度（m/s）
+  reach: 0.8,         // 打てる横距離（m）
+  missRate: 0.03,     // 基本ミス率（下げてラリーが続きやすいように）
+  speedMissFactor: 0.03, // 速い球に対する追加ミス率係数
+  aimError: 0.12      // 狙いのブレ（m。小さくして自滅アウトを減らす）
 };
 
 // ---------- ゲーム状態 ----------
@@ -249,7 +249,7 @@ const state = {
 
 // 内部データモデル（※メッシュの .position 直代入ではなく、
 //   player.x / player.z / cpu.x / cpu.z を毎フレーム反映して駆動する）
-const player = { x: 0, z: 2.1, swing: 0, swingDir: 1 };
+const player = { x: 0, z: 1.65, swing: 0, swingDir: 1 };
 const cpu = { x: 0, z: -1.95, targetX: 0, targetZ: -1.95, swing: 0, swingDir: 1, reactTimer: 0, willMiss: false, whiffed: false, serveTimer: 0 };
 
 const ball = {
@@ -263,6 +263,8 @@ const ball = {
   netHit: false,
   active: false,        // 飛行中か
   held: false,          // サーブ待ちでプレイヤーに追従中か
+  isServe: false,       // 現在飛んでいる球がサーブかどうか
+  serveBounced: false,  // サーブの自陣バウンドを消化済みか（1回だけ許可するため）
 };
 
 let frames = 0, elapsed = 0;
@@ -639,14 +641,20 @@ addEventListener('mouseup', e => {
  * 落ちる水平速度を与える。Tを固定して垂直速度を逆算する旧方式だと、
  * 台の長さに対して滞空時間が長くなり、山なりで高く飛びすぎてしまうため、
  * 「頂点の高さ」を直接指定できるこちらの方式に変更した。
+ *
+ * vyCapを指定すると、水平方向の速度(vx, vz)は本来の(apexに基づく)飛行時間Tを
+ * 基準に算出したまま、実際の上向き初速だけを小さく制限できる。これにより
+ * 「狙っている最終目標そのものへ向かって飛び始めるが、早めに落ち始めて
+ * 手前で台にバウンドする」という単一の弾道（サーブ用）を作れる。
  */
-function launchBall(x0, y0, z0, tx, tz, apex, spin, hitter) {
+function launchBall(x0, y0, z0, tx, tz, apex, spin, hitter, vyCap = Infinity) {
   const gEff = GRAVITY * (1 + 0.35 * spin);   // トップスピンで沈み、カットで浮く
-  const vy0 = Math.sqrt(2 * gEff * Math.max(apex, 0.02));
+  let vy0 = Math.sqrt(2 * gEff * Math.max(apex, 0.02));
   const landY = TABLE.H + BALL_R;
   // y0 + vy0*t - 0.5*g*t^2 = landY を満たす正の解（頂点を過ぎて着地する側の解）
   const disc = Math.max(0, vy0 * vy0 - 2 * gEff * (landY - y0));
   const T = Math.max(0.16, (vy0 + Math.sqrt(disc)) / gEff);
+  vy0 = Math.min(vy0, vyCap);
 
   ball.x = x0; ball.y = y0; ball.z = z0;
   ball.vx = (tx - x0) / T;
@@ -660,6 +668,22 @@ function launchBall(x0, y0, z0, tx, tz, apex, spin, hitter) {
   ball.netHit = false;
   ball.active = true;
   ball.held = false;
+  ball.isServe = false;
+  ball.serveBounced = false;
+}
+
+/**
+ * コース・パワー・スピン・打つ方向から、着地目標(tx, tz)と頂点の高さ(apex)を算出する。
+ */
+function computeTarget(course, power, spin, sign, minApex = 0.05) {
+  const tx = THREE.MathUtils.clamp(course, -1.25, 1.25) * (HALF_W * 0.92) * 1.1;
+  // course|>1.05相当で台幅の外に出うる（強打しすぎのリスク）
+  const depth = THREE.MathUtils.lerp(0.45, HALF_L + 0.12, power);
+  // power最大付近でエンドラインを越えうる
+  const tz = sign * depth;
+  // 頂点の高さ：パワーが高いほど低く速い弾道に。トップスピンはさらに低く、カットは高めに浮く
+  const apex = Math.max(minApex, THREE.MathUtils.lerp(0.2, 0.07, power) * (1 - 0.18 * spin));
+  return { tx, tz, apex };
 }
 
 function tryPlayerHit(course, power, spin) {
@@ -702,17 +726,20 @@ function doHit(who, course, power, spin, isServe = false) {
   const x0 = ball.x, z0 = ball.z;
   const y0 = Math.max(ball.y, TABLE.H + 0.12);
 
-  // ターゲット：コース→X、パワー→深さ
-  const tx = THREE.MathUtils.clamp(course, -1.25, 1.25) * (HALF_W * 0.92) * 1.1;
-  // course|>1.05相当で台幅の外に出うる（強打しすぎのリスク）
-  const depth = THREE.MathUtils.lerp(0.45, HALF_L + 0.12, power);
-  // power最大付近でエンドラインを越えうる
-  const tz = sign * depth;
+  if (isServe) {
+    // 正式ルールの「まず自陣に当ててから相手コートへ」を、狙いを変えずに実現する。
+    // 最終的な狙い（相手コート）はそのまま使いつつ、上向き初速だけ小さく抑えることで
+    // 進行方向は最初から最終目標のままに、手前（自陣）で早めに落ちて自然にバウンドする。
+    const { tx, tz, apex } = computeTarget(course, power, spin, sign);
+    launchBall(x0, y0, z0, tx, tz, apex, spin, who, 0.24);
+    ball.isServe = true;
+    ball.serveBounced = false;
+    ball.serveTargetZ = tz; // 自陣バウンド後、跳ね返りの高さをこの狙いに合わせて計算し直すために保持
+  } else {
+    const { tx, tz, apex } = computeTarget(course, power, spin, sign);
+    launchBall(x0, y0, z0, tx, tz, apex, spin, who);
+  }
 
-  // 頂点の高さ：パワーが高いほど低く速い弾道に。トップスピンはさらに低く、カットは高めに浮く
-  const apex = Math.max(0.05, THREE.MathUtils.lerp(0.2, 0.07, power) * (1 - 0.18 * spin));
-
-  launchBall(x0, y0, z0, tx, tz, apex, spin, who);
   sndHit();
   p.swing = 1.4;   // オーバースイング分を持たせてから素早く減衰させ、当たった瞬間を強調する
   p.swingDir = course >= 0 ? 1 : -1;
@@ -762,9 +789,26 @@ function updateBall(dt) {
     const sideIsPlayer = ball.z > 0;
     const hitterIsPlayer = ball.lastHit === 'player';
     if (sideIsPlayer === hitterIsPlayer) {
-      // 自分の打った球が自陣に落ちた → 失点
-      resolvePoint(hitterIsPlayer ? 'cpu' : 'player', 'アウト！');
-      return;
+      if (ball.isServe && !ball.serveBounced) {
+        // サーブの正規バウンド（自陣）：狙い・進行方向（vx, vz）はここでは一切変更しない。
+        // 跳ね返り後の上向き速度だけを、(a)残り距離をvzのまま進めば元の狙いに着地する高さと、
+        // (b)実際にネットを通過するタイミングで確実にネットを越えられる高さ、の大きい方に設定する。
+        ball.serveBounced = true;
+        const gEff2 = ball.gEff;
+        const remainingZ = ball.serveTargetZ - ball.z;
+        const T2 = Math.abs(ball.vz) > 0.05 ? remainingZ / ball.vz : 0.3;
+        const vySymmetric = T2 > 0.05 ? gEff2 * T2 / 2 : 1.2;
+
+        const netMinY = TABLE.H + TABLE.NET_H + BALL_R + 0.025; // 余裕を持たせたネット通過高さ
+        const tNet = Math.abs(ball.vz) > 0.05 ? Math.max(0.03, -ball.z / ball.vz) : 0.2;
+        const vyForNet = (netMinY - ball.y + 0.5 * gEff2 * tNet * tNet) / tNet;
+
+        ball.vy = Math.max(vySymmetric, vyForNet, 1.0);
+      } else {
+        // 自分の打った球が自陣に落ちた → 失点
+        resolvePoint(hitterIsPlayer ? 'cpu' : 'player', 'アウト！');
+        return;
+      }
     } else {
       ball.bouncedOnTarget = true;
       ball.sideBounces++;
@@ -808,6 +852,8 @@ function resolvePoint(winner, reason) {
   if (state.phase === 'point' || state.phase === 'over') return;
   state.phase = 'point';
   ball.active = false;
+  ball.isServe = false;
+  ball.serveBounced = false;
   if (winner === 'player') { state.scoreP++; sndPointP(); }
   else { state.scoreC++; sndPointC(); }
   updateScore();
@@ -838,6 +884,8 @@ function startServe() {
   ball.netHit = false;
   ball.bouncedOnTarget = false;
   ball.sideBounces = 0;
+  ball.isServe = false;
+  ball.serveBounced = false;
   if (state.serverIsPlayer) {
     ball.held = true;
     ball.active = false;
@@ -861,7 +909,7 @@ function resetGame() {
   state.scoreP = 0; state.scoreC = 0;
   state.serverIsPlayer = true;
   state.firstServerIsPlayer = true;
-  player.x = 0; player.z = 2.1;
+  player.x = 0; player.z = 1.65;
   cpu.x = 0; cpu.z = -1.95;
   updateScore();
   $('result').classList.add('hidden');
@@ -943,11 +991,12 @@ function loop(now) {
     // 前後移動は廃止。プレイヤーZ位置は固定（player.zは初期値のまま変化しない）
   }
 
-  // --- サーブ保持中はボールがプレイヤーに追従 ---
+  // --- サーブ保持中はボールがラケット付近に位置する ---
+  // ラケット（腕グループ内のブレード）はキャラクター基準で概ね(+0.3, 0.7, 0)付近にあるため、その近くに置く
   if (state.phase === 'serve' && state.serverIsPlayer && ball.held) {
-    ball.x = player.x + 0.15;
-    ball.y = TABLE.H + 0.35;
-    ball.z = player.z - 0.35;
+    ball.x = player.x + 0.26;
+    ball.y = 0.8;
+    ball.z = player.z - 0.05;
   }
 
   // --- ヒットストップ（当たった瞬間の一瞬の間）---
